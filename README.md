@@ -1,10 +1,10 @@
-# MCP Hub 🚀
+# MCP Citadel 🚀
 
 **Centralized MCP Server Management** - Route all your MCP servers through a single Unix socket
 
 ## What It Does
 
-Instead of spawning 18 MCP servers for every client (Claude, Warp, custom apps), MCP Hub:
+Instead of spawning 18 MCP servers for every client (Claude, Warp, custom apps), MCP Citadel:
 1. Starts all MCP servers ONCE
 2. Provides a single Unix socket endpoint
 3. Routes messages to the appropriate server
@@ -24,13 +24,13 @@ Instead of spawning 18 MCP servers for every client (Claude, Warp, custom apps),
 
 ```bash
 # List configured servers
-./target/release/mcp-hub servers
+./target/release/mcp-citadel servers
 
 # Start the hub
-./target/release/mcp-hub start --foreground
+./target/release/mcp-citadel start --foreground
 
 # In another terminal, test with netcat
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"server":"github"}}' | nc -U /tmp/mcp-hub.sock
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"server":"github"}}' | nc -U /tmp/mcp-citadel.sock
 ```
 
 ## Installation
@@ -40,15 +40,15 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"server":"github"}
 cargo build --release
 
 # Install system-wide
-sudo cp target/release/mcp-hub /usr/local/bin/
+sudo cp target/release/mcp-citadel /usr/local/bin/
 
 # Verify
-mcp-hub --help
+mcp-citadel --help
 ```
 
 ## Configuration
 
-MCP Hub automatically reads your Claude Desktop configuration at:
+MCP Citadel automatically reads your Claude Desktop configuration at:
 ```
 ~/Library/Application Support/Claude/claude_desktop_config.json
 ```
@@ -65,8 +65,8 @@ All 18+ MCP servers will be loaded automatically!
          │
          ↓
 ┌────────────────────┐
-│   MCP Hub          │  ← Single process
-│   /tmp/mcp-hub.sock│
+│   MCP Citadel          │  ← Single process
+│   /tmp/mcp-citadel.sock│
 └────────┬───────────┘
          │
          ├→ github-mcp
@@ -78,6 +78,33 @@ All 18+ MCP servers will be loaded automatically!
 
 ## Usage in Clients
 
+### Option 1: Client Adapter (Recommended - Zero Config!)
+
+The client adapter provides transparent routing. Update your Claude Desktop config:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "mcp-client",
+      "args": ["github"]
+    },
+    "tavily": {
+      "command": "mcp-client",
+      "args": ["tavily-mcp"]
+    }
+  }
+}
+```
+
+**That's it!** The adapter automatically:
+- Connects to the hub
+- Injects the server name into messages
+- Forwards responses back to the client
+- No message format changes needed!
+
+### Option 2: Direct Connection with socat
+
 Update your client MCP config to point to the hub:
 
 ```json
@@ -85,7 +112,7 @@ Update your client MCP config to point to the hub:
   "mcpServers": {
     "hub": {
       "command": "socat",
-      "args": ["UNIX-CONNECT:/tmp/mcp-hub.sock", "STDIO"]
+      "args": ["UNIX-CONNECT:/tmp/mcp-citadel.sock", "STDIO"]
     }
   }
 }
@@ -116,13 +143,17 @@ Or use method prefixes:
 
 ## Features
 
-✅ Pure Rust - blazing fast, 5MB binary  
+✅ Pure Rust - blazing fast, 1.2MB binary  
 ✅ Async/await with Tokio  
 ✅ Automatic config loading from Claude Desktop  
 ✅ Unix socket for IPC  
 ✅ Smart message routing  
 ✅ Concurrent client handling  
 ✅ Graceful error handling  
+✅ **Client adapter** - transparent proxy (619KB)  
+✅ **Daemon mode** - background process with PID management  
+✅ **Health monitoring** - auto-restart crashed servers  
+✅ **Status tracking** - uptime, server count, metrics
 
 ## Performance
 
@@ -134,10 +165,14 @@ Or use method prefixes:
 ## CLI Commands
 
 ```bash
-mcp-hub servers          # List configured servers
-mcp-hub start            # Start hub (foreground)
-mcp-hub stop             # Stop hub
-mcp-hub status           # Show status
+mcp-citadel servers           # List configured servers
+mcp-citadel start             # Start hub as daemon (background)
+mcp-citadel start --foreground # Start hub in foreground
+mcp-citadel stop              # Stop daemon
+mcp-citadel status            # Show status (PID, uptime, server count)
+
+# Client adapter
+mcp-client <server-name>  # Connect to specific server via hub
 ```
 
 ## Development

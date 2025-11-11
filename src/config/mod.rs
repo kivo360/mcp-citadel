@@ -1,4 +1,4 @@
-//! Configuration module for MCP Hub
+//! Configuration module for MCP Citadel
 //! Loads server configurations from Claude Desktop config
 
 use anyhow::{Context, Result};
@@ -21,7 +21,7 @@ impl Default for HubConfig {
     fn default() -> Self {
         let home = dirs::home_dir().expect("Could not find home directory");
         Self {
-            socket_path: "/tmp/mcp-hub.sock".to_string(),
+            socket_path: "/tmp/mcp-citadel.sock".to_string(),
             log_level: "info".to_string(),
             claude_config_path: home
                 .join("Library/Application Support/Claude/claude_desktop_config.json"),
@@ -80,7 +80,7 @@ pub fn load_claude_config(path: &Path) -> Result<Vec<ServerConfig>> {
 /// Load hub configuration
 pub fn load_hub_config() -> Result<HubConfig> {
     // For now, just use defaults
-    // Later: load from ~/.mcp-hub/config.toml
+    // Later: load from ~/.mcp-citadel/config.toml
     Ok(HubConfig::default())
 }
 
@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = HubConfig::default();
-        assert_eq!(config.socket_path, "/tmp/mcp-hub.sock");
+        assert_eq!(config.socket_path, "/tmp/mcp-citadel.sock");
         assert_eq!(config.log_level, "info");
     }
 }

@@ -1,4 +1,4 @@
-# MCP Hub - Implementation Complete! 🎉
+# MCP Citadel - Implementation Complete! 🎉
 
 ## What We Built
 
@@ -17,7 +17,7 @@ A **production-ready Rust application** that centralizes MCP server management, 
 
 ```
 ┌──────────────────────────────────────────┐
-│          MCP Hub (Rust)                  │
+│          MCP Citadel (Rust)                  │
 │                                          │
 │  ┌────────────────────────────────────┐ │
 │  │   Config Loader                    │ │
@@ -34,7 +34,7 @@ A **production-ready Rust application** that centralizes MCP server management, 
 │                                          │
 │  ┌────────────────────────────────────┐ │
 │  │   Unix Socket Router               │ │
-│  │   • Listens on /tmp/mcp-hub.sock   │ │
+│  │   • Listens on /tmp/mcp-citadel.sock   │ │
 │  │   • Handles concurrent clients     │ │
 │  │   • Smart server name extraction   │ │
 │  └────────────────────────────────────┘ │
@@ -44,7 +44,7 @@ A **production-ready Rust application** that centralizes MCP server management, 
 ## Files Created
 
 ```
-mcp-hub/
+mcp-citadel/
 ├── Cargo.toml          # Dependencies & build config
 ├── README.md           # User documentation
 ├── IMPLEMENTATION.md   # This file
@@ -73,7 +73,7 @@ mcp-hub/
 - Error recovery per-server
 
 ✅ **Message Routing**
-- Unix socket listener at `/tmp/mcp-hub.sock`
+- Unix socket listener at `/tmp/mcp-citadel.sock`
 - Extracts server name from:
   - `params.server` field
   - Method prefix (e.g., `github/tools/list`)
@@ -81,10 +81,10 @@ mcp-hub/
 - Returns responses to client
 
 ✅ **CLI**
-- `mcp-hub servers` - List configured servers
-- `mcp-hub start` - Start the hub
-- `mcp-hub status` - Show status (TODO)
-- `mcp-hub stop` - Stop hub (TODO)
+- `mcp-citadel servers` - List configured servers
+- `mcp-citadel start` - Start the hub
+- `mcp-citadel status` - Show status (TODO)
+- `mcp-citadel stop` - Stop hub (TODO)
 
 ✅ **Production Ready**
 - Async/await with Tokio
@@ -95,7 +95,7 @@ mcp-hub/
 
 ## Memory Savings Calculation
 
-**Before MCP Hub:**
+**Before MCP Citadel:**
 ```
 3 clients (Claude, Warp, custom)
   × 18 servers each
@@ -103,7 +103,7 @@ mcp-hub/
 = 54 processes, ~5.4GB
 ```
 
-**After MCP Hub:**
+**After MCP Citadel:**
 ```
 1 hub (2MB)
   + 18 servers (1×)
@@ -144,9 +144,9 @@ dirs = "6.0"            # Home directory
 
 ```bash
 # Terminal 1: Start the hub
-$ mcp-hub start --foreground
+$ mcp-citadel start --foreground
 
-🚀 Starting MCP Hub...
+🚀 Starting MCP Citadel...
    Loaded 18 MCP servers from Claude config
 
 ✓ Started 18 servers:
@@ -156,16 +156,16 @@ $ mcp-hub start --foreground
   • context7-mcp
   • ... (14 more)
 
-✓ Router ready on /tmp/mcp-hub.sock
+✓ Router ready on /tmp/mcp-citadel.sock
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  MCP Hub is running!
+  MCP Citadel is running!
   Press Ctrl+C to stop
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # Terminal 2: Test with netcat
 $ echo '{"jsonrpc":"2.0","id":1,"method":"github/tools/list"}' | \
-  nc -U /tmp/mcp-hub.sock
+  nc -U /tmp/mcp-citadel.sock
 
 # Returns: MCP response from GitHub server
 ```
@@ -180,7 +180,7 @@ Update Claude config:
   "mcpServers": {
     "hub": {
       "command": "socat",
-      "args": ["UNIX-CONNECT:/tmp/mcp-hub.sock", "STDIO"]
+      "args": ["UNIX-CONNECT:/tmp/mcp-citadel.sock", "STDIO"]
     }
   }
 }
@@ -265,11 +265,11 @@ cargo check                             # Quick syntax check
 # Production
 cargo build --release                   # Build optimized binary
 ./install.sh                            # Install system-wide
-mcp-hub start --foreground              # Run installed version
+mcp-citadel start --foreground              # Run installed version
 
 # Debugging
-RUST_LOG=debug mcp-hub start            # Verbose logging
-RUST_LOG=trace mcp-hub start            # Very verbose
+RUST_LOG=debug mcp-citadel start            # Verbose logging
+RUST_LOG=trace mcp-citadel start            # Very verbose
 ```
 
 ## Project Timeline
@@ -286,7 +286,7 @@ RUST_LOG=trace mcp-hub start            # Very verbose
 
 **WE FUCKING DID IT!** 🎉
 
-Pure Rust implementation of MCP Hub that:
+Pure Rust implementation of MCP Citadel that:
 - Loads all 18 of your MCP servers
 - Provides centralized routing
 - Saves 67% memory (3.6GB)
@@ -299,11 +299,11 @@ Ready to install and test with your actual Claude Desktop? 🚀
 
 ```bash
 ./install.sh
-mcp-hub start --foreground
+mcp-citadel start --foreground
 ```
 
 ---
 
 **Built with 🦀 Rust by Kevin Hill**
 **Date:** November 11, 2025
-**Location:** ~/Coding/Experiments/mcp-hub
+**Location:** ~/Coding/Experiments/mcp-citadel

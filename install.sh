@@ -1,32 +1,37 @@
 #!/bin/bash
-# MCP Hub Installation Script
+# MCP Citadel Installation Script
 
 set -e
 
-echo "🚀 Installing MCP Hub..."
+echo "🚀 Installing MCP Citadel..."
 echo ""
 
-# Build if not already built
-if [ ! -f "target/release/mcp-hub" ]; then
-    echo "Building release binary..."
-    cargo build --release
+# Build both binaries if not already built
+if [ ! -f "target/release/mcp-citadel" ] || [ ! -f "target/release/mcp-client" ]; then
+    echo "Building release binaries..."
+    cargo build --release --bins
     echo ""
 fi
 
-# Copy to /usr/local/bin
-echo "Installing to /usr/local/bin/mcp-hub..."
-sudo cp target/release/mcp-hub /usr/local/bin/
+# Copy both binaries to /usr/local/bin
+echo "Installing binaries to /usr/local/bin/..."
+sudo cp target/release/mcp-citadel /usr/local/bin/
+sudo cp target/release/mcp-client /usr/local/bin/
+sudo chmod +x /usr/local/bin/mcp-citadel
+sudo chmod +x /usr/local/bin/mcp-client
 
 # Verify
 echo ""
 echo "✅ Installation complete!"
 echo ""
-echo "Verify installation:"
-echo "  mcp-hub --version"
+echo "Installed binaries:"
+echo "  • mcp-citadel    ($(ls -lh /usr/local/bin/mcp-citadel | awk '{print $5}')) - Hub daemon"
+echo "  • mcp-client ($(ls -lh /usr/local/bin/mcp-client | awk '{print $5}')) - Client adapter"
 echo ""
-echo "List configured servers:"
-echo "  mcp-hub servers"
+echo "Quick start:"
+echo "  1. List servers:    mcp-citadel servers"
+echo "  2. Start hub:       mcp-citadel start"
+echo "  3. Check status:    mcp-citadel status"
 echo ""
-echo "Start the hub:"
-echo "  mcp-hub start --foreground"
+echo "Next: Update Claude config to use mcp-client (see PRODUCTION.md)"
 echo ""

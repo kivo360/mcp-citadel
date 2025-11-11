@@ -1,10 +1,11 @@
-//! CLI module for MCP Hub
+//! CLI module for MCP Citadel
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "mcp-hub")]
-#[command(about = "MCP Hub - Centralized MCP server management", long_about = None)]
+#[command(name = "mcp-citadel")]
+#[command(about = "MCP Citadel - Centralized MCP server management", long_about = None)]
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]
@@ -18,6 +19,10 @@ pub enum Commands {
         /// Run in foreground (don't daemonize)
         #[arg(short, long)]
         foreground: bool,
+        
+        /// Log file path (default: stdout)
+        #[arg(long)]
+        log_file: Option<PathBuf>,
     },
 
     /// Stop the MCP hub

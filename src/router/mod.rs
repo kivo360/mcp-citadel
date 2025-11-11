@@ -1,4 +1,4 @@
-//! MCP Hub Router
+//! MCP Citadel Router
 //! Routes MCP messages from clients to backend MCP servers
 
 use anyhow::{Context, Result};
@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
@@ -19,6 +19,8 @@ pub struct MCPServerProcess {
     process: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    stderr: BufReader<ChildStderr>,
+    start_time: std::time::Instant,
 }
 
 impl MCPServerProcess {
@@ -32,11 +34,18 @@ impl MCPServerProcess {
         );
 
         let mut cmd = Command::new(&config.command);
+        
+        // Inherit parent environment and merge with config env
+        // This ensures servers have access to PATH, HOME, etc.
+        let mut merged_env: HashMap<String, String> = std::env::vars().collect();
+        merged_env.extend(config.env.clone());
+        
         cmd.args(&config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .envs(&config.env);
+            .stderr(Stdio::piped())
+            .env_clear()
+            .envs(&merged_env);
 
         let mut process = cmd
             .spawn()
@@ -51,17 +60,47 @@ impl MCPServerProcess {
             .stdout
             .take()
             .context("Failed to get stdout")?;
+        
+        let stderr = process
+            .stderr
+            .take()
+            .context("Failed to get stderr")?;
 
         let stdout = BufReader::new(stdout);
+        let stderr = BufReader::new(stderr);
 
         info!("✓ Started MCP server: {} (PID: {:?})", config.name, process.id());
-
-        Ok(Self {
-            name: config.name,
+        
+        let mut server = Self {
+            name: config.name.clone(),
             process,
             stdin,
             stdout,
-        })
+            stderr,
+            start_time: std::time::Instant::now(),
+        };
+        
+        // Wait 100ms and check if it immediately crashed
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        if let Ok(Some(status)) = server.process.try_wait() {
+            // Read any error output
+            let mut error_msg = String::new();
+            let _ = server.stderr.read_line(&mut error_msg).await;
+            
+            warn!("Server {} crashed during startup: {:?}", config.name, status);
+            if !error_msg.is_empty() {
+                warn!("Error output: {}", error_msg.trim());
+            }
+            
+            return Err(anyhow::anyhow!(
+                "Server crashed immediately with status: {:?}. Error: {}",
+                status,
+                error_msg.trim()
+            ));
+        }
+        
+        Ok(server)
     }
 
     /// Send a message and receive response
@@ -86,9 +125,12 @@ impl MCPServerProcess {
     }
 }
 
-/// MCP Hub Server Manager
+/// MCP Citadel Server Manager
 pub struct HubManager {
     servers: Arc<Mutex<HashMap<String, MCPServerProcess>>>,
+    configs: Vec<ServerConfig>,
+    start_time: std::time::Instant,
+    restart_counts: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl HubManager {
@@ -96,7 +138,7 @@ impl HubManager {
     pub async fn new(configs: Vec<ServerConfig>) -> Result<Self> {
         let mut servers = HashMap::new();
 
-        for config in configs {
+        for config in &configs {
             match MCPServerProcess::start(config.clone()).await {
                 Ok(server) => {
                     servers.insert(config.name.clone(), server);
@@ -109,6 +151,9 @@ impl HubManager {
 
         Ok(Self {
             servers: Arc::new(Mutex::new(servers)),
+            configs,
+            start_time: std::time::Instant::now(),
+            restart_counts: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -138,9 +183,94 @@ impl HubManager {
         }
         Ok(())
     }
+
+    /// Check health of all servers and restart crashed ones
+    pub async fn health_check(&self) -> Result<()> {
+        let mut servers = self.servers.lock().await;
+        let mut restart_counts = self.restart_counts.lock().await;
+        
+        const MAX_RESTARTS: u32 = 3;
+        
+        for config in &self.configs {
+            // Check if server exists
+            if let Some(server) = servers.get_mut(&config.name) {
+                // Check if process is still alive
+                match server.process.try_wait() {
+                    Ok(Some(status)) => {
+                        let uptime = server.start_time.elapsed();
+                        let count = restart_counts.entry(config.name.clone()).or_insert(0);
+                        
+                        // Immediate crash detection (< 5 seconds)
+                        let is_immediate_crash = uptime.as_secs() < 5;
+                        
+                        if is_immediate_crash {
+                            error!(
+                                "Server {} crashed immediately ({:.1}s uptime) with status: {:?}",
+                                config.name, uptime.as_secs_f32(), status
+                            );
+                            error!("This usually means:");
+                            error!("  • Wrong command or arguments in Claude config");
+                            error!("  • Missing dependencies (run: npm install -g {})", config.command);
+                            error!("  • Incompatible CLI version");
+                            error!("Command: {} {:?}", config.command, config.args);
+                            
+                            // Don't retry immediate crashes - they're config errors
+                            servers.remove(&config.name);
+                            continue;
+                        }
+                        
+                        if *count >= MAX_RESTARTS {
+                            error!(
+                                "Server {} has crashed {} times. Giving up. Check your Claude config.",
+                                config.name, count
+                            );
+                            servers.remove(&config.name);
+                            continue;
+                        }
+                        
+                        warn!("Server {} exited after {:.1}s with status: {:?}", config.name, uptime.as_secs_f32(), status);
+                        *count += 1;
+                        
+                        // Restart the server
+                        info!("Restarting server: {} (attempt {}/{})", config.name, count, MAX_RESTARTS);
+                        match MCPServerProcess::start(config.clone()).await {
+                            Ok(new_server) => {
+                                servers.insert(config.name.clone(), new_server);
+                                info!("✓ Restarted server: {}", config.name);
+                            }
+                            Err(e) => {
+                                error!("Failed to restart server {}: {}", config.name, e);
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Still running, all good
+                        // Reset restart count on successful health check
+                        restart_counts.insert(config.name.clone(), 0);
+                    }
+                    Err(e) => {
+                        error!("Error checking server {}: {}", config.name, e);
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Get uptime
+    pub fn uptime(&self) -> std::time::Duration {
+        self.start_time.elapsed()
+    }
+
+    /// Get server count
+    pub async fn server_count(&self) -> usize {
+        let servers = self.servers.lock().await;
+        servers.len()
+    }
 }
 
-/// MCP Hub Router - Unix socket server
+/// MCP Citadel Router - Unix socket server
 pub struct HubRouter {
     socket_path: String,
     manager: Arc<HubManager>,
@@ -148,10 +278,10 @@ pub struct HubRouter {
 
 impl HubRouter {
     /// Create a new router
-    pub fn new(socket_path: String, manager: HubManager) -> Self {
+    pub fn new(socket_path: String, manager: Arc<HubManager>) -> Self {
         Self {
             socket_path,
-            manager: Arc::new(manager),
+            manager,
         }
     }
 
@@ -162,8 +292,17 @@ impl HubRouter {
 
         let listener = UnixListener::bind(&self.socket_path)
             .context("Failed to bind Unix socket")?;
+        
+        // Set socket permissions to 0600 (owner only) for security
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&self.socket_path)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&self.socket_path, perms)?;
+        }
 
-        info!("🚀 MCP Hub listening on {}", self.socket_path);
+        info!("🚀 MCP Citadel listening on {}", self.socket_path);
 
         loop {
             match listener.accept().await {

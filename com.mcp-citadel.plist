@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mcp-citadel</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/mcp-citadel</string>
+        <string>start</string>
+        <string>--foreground</string>
+        <string>--log-file</string>
+        <string>/Users/kevinhill/.mcp-citadel/hub.log</string>
+    </array>
+    
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    
+    <key>StandardOutPath</key>
+    <string>/Users/kevinhill/.mcp-citadel/stdout.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/Users/kevinhill/.mcp-citadel/stderr.log</string>
+    
+    <key>WorkingDirectory</key>
+    <string>/Users/kevinhill</string>
+    
+    <key>ProcessType</key>
+    <string>Background</string>
+    
+    <key>Nice</key>
+    <integer>-10</integer>
+</dict>
+</plist>
