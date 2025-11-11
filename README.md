@@ -1,12 +1,14 @@
 # MCP Citadel 🚀
 
-**Centralized MCP Server Management** - Route all your MCP servers through a single Unix socket
+**Centralized MCP Server Management** - Route all your MCP servers through a single hub with Unix socket and HTTP/SSE transports
 
 ## What It Does
 
 Instead of spawning 18 MCP servers for every client (Claude, Warp, custom apps), MCP Citadel:
 1. Starts all MCP servers ONCE
-2. Provides a single Unix socket endpoint
+2. Provides dual transport endpoints:
+   - **Unix socket** for local clients (default)
+   - **HTTP/SSE** for remote access (optional)
 3. Routes messages to the appropriate server
 
 ## Memory Savings
@@ -146,14 +148,17 @@ Or use method prefixes:
 ✅ Pure Rust - blazing fast, 1.2MB binary  
 ✅ Async/await with Tokio  
 ✅ Automatic config loading from Claude Desktop  
-✅ Unix socket for IPC  
+✅ **Dual transports** - Unix socket + HTTP/SSE (MCP spec 2025-06-18)  
 ✅ Smart message routing  
 ✅ Concurrent client handling  
 ✅ Graceful error handling  
 ✅ **Client adapter** - transparent proxy (619KB)  
 ✅ **Daemon mode** - background process with PID management  
 ✅ **Health monitoring** - auto-restart crashed servers  
-✅ **Status tracking** - uptime, server count, metrics
+✅ **Status tracking** - uptime, server count, metrics  
+✅ **HTTP/SSE transport** - Streamable HTTP for remote access  
+✅ **Session management** - Secure UUID-based sessions  
+✅ **Origin validation** - DNS rebinding protection
 
 ## Performance
 
@@ -171,15 +176,39 @@ mcp-citadel start --foreground # Start hub in foreground
 mcp-citadel stop              # Stop daemon
 mcp-citadel status            # Show status (PID, uptime, server count)
 
+# HTTP transport
+mcp-citadel start --foreground --enable-http              # Enable HTTP on port 3000
+mcp-citadel start --foreground --enable-http --http-port 8080 # Custom port
+
 # Client adapter
 mcp-client <server-name>  # Connect to specific server via hub
 ```
+
+## HTTP/SSE Transport
+
+MCP Citadel supports **Streamable HTTP** transport (MCP spec 2025-06-18) for remote access:
+
+```bash
+# Enable HTTP transport
+mcp-citadel start --foreground --enable-http
+
+# Test with curl
+curl -X POST http://127.0.0.1:3000/mcp \
+  -H "Content-Type: application/json" \
+  -H "MCP-Protocol-Version: 2025-06-18" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{...}}'
+```
+
+**Security:** HTTP transport binds to `127.0.0.1` by default and validates Origin headers to prevent DNS rebinding attacks. See [HTTP_TRANSPORT.md](HTTP_TRANSPORT.md) for full documentation.
 
 ## Development
 
 ```bash
 # Run in dev mode
 cargo run -- start --foreground
+
+# Run with HTTP transport
+cargo run -- start --foreground --enable-http
 
 # Run tests
 cargo test

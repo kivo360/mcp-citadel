@@ -1,6 +1,6 @@
 [package]
 name = "mcp-citadel"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Kevin Hill"]
 description = "The Citadel: Central hub for routing multiple MCP servers with 67% memory savings"
@@ -9,10 +9,21 @@ license = "MIT"
 [dependencies]
 # Async runtime
 tokio = { version = "1.46", features = ["full"] }
+tokio-stream = "0.1"
+
+# HTTP server and SSE
+axum = "0.7"
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+headers = "0.4"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# UUID for session IDs
+uuid = { version = "1.11", features = ["v4"] }
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }

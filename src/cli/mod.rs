@@ -23,6 +23,18 @@ pub enum Commands {
         /// Log file path (default: stdout)
         #[arg(long)]
         log_file: Option<PathBuf>,
+        
+        /// Enable HTTP transport
+        #[arg(long)]
+        enable_http: bool,
+        
+        /// HTTP port (default: 3000)
+        #[arg(long, default_value = "3000")]
+        http_port: u16,
+        
+        /// HTTP host (default: 127.0.0.1)
+        #[arg(long, default_value = "127.0.0.1")]
+        http_host: String,
     },
 
     /// Stop the MCP hub

@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod daemon;
 mod router;
+mod transport;
 
 use anyhow::Result;
 use clap::Parser;
@@ -13,15 +14,16 @@ use tracing_subscriber;
 use cli::{Cli, Commands};
 use config::{load_claude_config, load_hub_config};
 use router::{HubManager, HubRouter};
+use transport::HttpTransport;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { foreground, log_file } => {
+        Commands::Start { foreground, log_file, enable_http, http_port, http_host } => {
             if foreground {
-                start_hub(foreground, log_file).await?;
+                start_hub(foreground, log_file, enable_http, http_port, http_host).await?;
             } else {
                 daemon::daemonize()?;
             }
@@ -41,7 +43,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn start_hub(_foreground: bool, log_file: Option<std::path::PathBuf>) -> Result<()> {
+async fn start_hub(
+    _foreground: bool, 
+    log_file: Option<std::path::PathBuf>,
+    enable_http: bool,
+    http_port: u16,
+    http_host: String,
+) -> Result<()> {
     // Check if already running
     if daemon::is_running()? {
         eprintln!("❌ MCP Citadel is already running!");
@@ -95,7 +103,17 @@ async fn start_hub(_foreground: bool, log_file: Option<std::path::PathBuf>) -> R
     }
 
     // Load configuration
-    let hub_config = load_hub_config()?;
+    let mut hub_config = load_hub_config()?;
+    
+    // Override HTTP config from CLI flags
+    if enable_http {
+        if let Some(http_config) = &mut hub_config.http {
+            http_config.enabled = true;
+            http_config.port = http_port;
+            http_config.host = http_host.clone();
+        }
+    }
+    
     let server_configs = load_claude_config(&hub_config.claude_config_path)?;
 
     println!("🚀 Starting MCP Citadel...");
@@ -142,7 +160,7 @@ async fn start_hub(_foreground: bool, log_file: Option<std::path::PathBuf>) -> R
         }
     });
 
-    // Start router in background
+    // Start Unix socket router in background
     let router_manager = Arc::clone(&manager);
     let socket_path_for_cleanup = hub_config.socket_path.clone();
     let router_task = tokio::spawn(async move {
@@ -150,17 +168,54 @@ async fn start_hub(_foreground: bool, log_file: Option<std::path::PathBuf>) -> R
         router.start().await
     });
 
+    // Start HTTP transport if enabled
+    let http_task = if let Some(http_config) = hub_config.http.clone() {
+        if http_config.enabled {
+            let http_manager = Arc::clone(&manager);
+            Some(tokio::spawn(async move {
+                let transport = HttpTransport::new(http_config, http_manager);
+                transport.start().await
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Wait for shutdown signal
-    tokio::select! {
-        result = router_task => {
-            match result {
-                Ok(Ok(())) => info!("Router task completed"),
-                Ok(Err(e)) => warn!("Router error: {}", e),
-                Err(e) => warn!("Router task panicked: {}", e),
+    if let Some(http) = http_task {
+        tokio::select! {
+            result = router_task => {
+                match result {
+                    Ok(Ok(())) => info!("Unix socket router completed"),
+                    Ok(Err(e)) => warn!("Unix socket router error: {}", e),
+                    Err(e) => warn!("Unix socket router panicked: {}", e),
+                }
+            }
+            result = http => {
+                match result {
+                    Ok(Ok(())) => info!("HTTP transport completed"),
+                    Ok(Err(e)) => warn!("HTTP transport error: {}", e),
+                    Err(e) => warn!("HTTP transport panicked: {}", e),
+                }
+            }
+            _ = shutdown_signal() => {
+                info!("Shutdown signal received");
             }
         }
-        _ = shutdown_signal() => {
-            info!("Shutdown signal received");
+    } else {
+        tokio::select! {
+            result = router_task => {
+                match result {
+                    Ok(Ok(())) => info!("Unix socket router completed"),
+                    Ok(Err(e)) => warn!("Unix socket router error: {}", e),
+                    Err(e) => warn!("Unix socket router panicked: {}", e),
+                }
+            }
+            _ = shutdown_signal() => {
+                info!("Shutdown signal received");
+            }
         }
     }
 

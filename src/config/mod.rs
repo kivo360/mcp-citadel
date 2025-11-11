@@ -15,6 +15,21 @@ pub struct HubConfig {
     pub log_level: String,
     /// Path to Claude Desktop config
     pub claude_config_path: PathBuf,
+    /// HTTP transport configuration (optional)
+    pub http: Option<HttpConfig>,
+}
+
+/// HTTP transport configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpConfig {
+    /// Enable HTTP transport
+    pub enabled: bool,
+    /// Host to bind to (default: 127.0.0.1 for security)
+    pub host: String,
+    /// Port to listen on
+    pub port: u16,
+    /// Session timeout in seconds
+    pub session_timeout_secs: u64,
 }
 
 impl Default for HubConfig {
@@ -25,6 +40,18 @@ impl Default for HubConfig {
             log_level: "info".to_string(),
             claude_config_path: home
                 .join("Library/Application Support/Claude/claude_desktop_config.json"),
+            http: Some(HttpConfig::default()),
+        }
+    }
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false, // Disabled by default for security
+            host: "127.0.0.1".to_string(),
+            port: 3000,
+            session_timeout_secs: 3600, // 1 hour
         }
     }
 }
