@@ -121,6 +121,104 @@ mcp-citadel status
 
 ## [Unreleased]
 
+## [0.3.0] - 2025-01-11
+
+### ⚡ Async SSE Streaming Release
+
+**Major improvement:** HTTP transport now truly async with SSE streaming!
+
+### Fixed
+
+#### HTTP Transport Blocking Issue (v0.2.0)
+- **Problem:** HTTP requests blocked waiting for MCP server responses, causing timeouts
+- **Solution:** Refactored to return SSE stream immediately, process responses asynchronously
+
+### Changed
+
+#### HTTP Handler Architecture
+- **POST /mcp now returns SSE stream** instead of blocking for response
+- Backend routing happens in spawned async task
+- Responses delivered via Server-Sent Events
+- Session ID sent as first SSE event for initialize requests
+
+**Before (v0.2.0):**
+```
+POST → Wait for MCP → Return JSON ❌ (blocked, timeout)
+```
+
+**After (v0.3.0):**
+```
+POST → Return SSE → MCP processes → Stream response ✅ (async)
+```
+
+### Added
+
+- **Stream boxing** for type consistency across different SSE streams
+- **Session events** - Special SSE event type for session initialization
+- Enhanced futures support for stream chaining
+
+### Technical Details
+
+#### Implementation
+```rust
+// Spawn async task for backend routing
+tokio::spawn(async move {
+    match manager.route_message(&server_name, &body).await {
+        Ok(response) => {
+            // Send via SSE (non-blocking)
+            let _ = tx.send(Ok(event)).await;
+        }
+    }
+});
+
+// Return SSE stream immediately
+Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+```
+
+### Performance
+
+- **Zero HTTP timeout** - Handler returns instantly
+- **Concurrent requests** - Multiple MCP operations can happen in parallel
+- **Memory efficient** - Streams don't block threads
+
+### Testing
+
+```bash
+# Now works without timeout!
+curl -N -X POST http://127.0.0.1:3000/mcp \
+  -H "Content-Type: application/json" \
+  -H "MCP-Protocol-Version: 2025-06-18" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize",...}'
+
+# Output (immediate):
+event: session
+data: {"sessionId":"257461bd-..."}
+
+data: {"jsonrpc":"2.0","id":1,"result":{...}}
+```
+
+### Migration from v0.2.0
+
+**Breaking change:** HTTP responses now via SSE instead of direct JSON.
+
+Clients must handle SSE streams:
+- **initialize** requests get `session` event first, then response
+- All responses come through `data:` events
+- Keep connection open to receive response
+
+### Compatibility
+
+- ✅ Unix socket transport unchanged
+- ✅ Backward compatible CLI flags
+- ⚠️ HTTP clients need SSE support (curl with `-N`)
+
+### Known Limitations
+
+- SSE is one-way (server→client); POST required for each client message
+- No message replay/resumability yet (planned for v0.4.0)
+
+---
+
 ## [0.2.0] - 2025-01-11
 
 ### 🌐 HTTP/SSE Transport Release

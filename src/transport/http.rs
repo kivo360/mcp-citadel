@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::{wrappers::ReceiverStream, Stream};
+use futures::StreamExt;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -119,35 +120,27 @@ impl HttpTransport {
     }
 }
 
-/// Handle POST /mcp - Client sends JSON-RPC message
+/// Handle POST /mcp - Client sends JSON-RPC message (returns SSE stream)
 async fn handle_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Response, StatusCode> {
-    // 1. Validate Origin header (prevent DNS rebinding attacks)
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    // 1. Validate Origin header
     validate_origin(&headers)?;
 
     // 2. Check protocol version
     let protocol_version = headers
         .get("mcp-protocol-version")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("2025-03-26"); // Fallback for backwards compatibility
+        .unwrap_or("2025-03-26");
 
     if protocol_version != MCP_PROTOCOL_VERSION && protocol_version != "2025-03-26" {
         warn!("Unsupported protocol version: {}", protocol_version);
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // 3. Get or create session
-    let session_id = headers
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-
-    let mut sessions = state.sessions.lock().await;
-    
-    // Parse JSON-RPC message to determine type
+    // 3. Parse message
     let json_value: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
@@ -157,89 +150,106 @@ async fn handle_post(
         .map(|m| m == "initialize")
         .unwrap_or(false);
 
-    let message_id = json_value.get("id");
-    let is_request = message_id.is_some();
+    // 4. Get or create session
+    let session_id = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
 
-    // Handle session management
+    let mut sessions = state.sessions.lock().await;
+    
     let session = if is_initialize {
-        // Initialize creates a new session
         let new_session = HttpSession::new();
-        let session_id = new_session.id.clone();
-        sessions.insert(session_id.clone(), new_session.clone());
+        let sid = new_session.id.clone();
+        sessions.insert(sid.clone(), new_session.clone());
         new_session
     } else if let Some(sid) = session_id {
-        // Use existing session
         sessions.get_mut(&sid)
             .ok_or(StatusCode::NOT_FOUND)?
             .clone()
     } else {
-        // No session ID and not initialize
         return Err(StatusCode::BAD_REQUEST);
     };
 
-    // Extract server name from message
-    let server_name = extract_server_name(&body);
+    let session_id = session.id.clone();
+    
+    // Extract server name
+    let server_name = extract_server_name(&body)
+        .ok_or(StatusCode::BAD_REQUEST)?;
 
-    // 4. Route message to backend
-    if let Some(name) = &server_name {
-        match state.manager.route_message(name, &body).await {
+    // 5. Create SSE channel for this request
+    let (tx, rx) = mpsc::channel(100);
+    
+    // Update session with SSE sender
+    if let Some(session_mut) = sessions.get_mut(&session_id) {
+        session_mut.touch();
+        session_mut.server_name = Some(server_name.clone());
+        session_mut.event_tx = Some(tx.clone());
+    }
+    
+    drop(sessions);
+
+    // 6. Spawn async task to handle backend communication
+    let manager = state.manager.clone();
+    let body_clone = body.to_vec();
+    let is_init = is_initialize;
+    
+    tokio::spawn(async move {
+        // Route message to backend (non-blocking for this HTTP handler)
+        match manager.route_message(&server_name, &body_clone).await {
             Ok(response) => {
-                // Update session
-                if let Some(session_mut) = sessions.get_mut(&session.id) {
-                    session_mut.touch();
-                    session_mut.server_name = server_name.clone();
-                }
-                drop(sessions);
-
-                // For requests, we need to decide: SSE stream or direct response
-                // For now, return direct JSON response (simple mode)
-                if is_initialize {
-                    // Return InitializeResult with session ID
-                    Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .header("mcp-session-id", session.id)
-                        .body(axum::body::Body::from(response))
-                        .unwrap())
-                } else if is_request {
-                    // For other requests, return JSON response
-                    Ok(Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(axum::body::Body::from(response))
-                        .unwrap())
+                // Parse response to extract event data
+                if let Ok(json) = std::str::from_utf8(&response) {
+                    let event = Event::default()
+                        .data(json.trim_end());
+                    
+                    // Send via SSE
+                    let _ = tx.send(Ok(event)).await;
+                    
+                    // For initialize, we need to include session ID in a custom header
+                    // (will be handled by response builder below)
                 } else {
-                    // Notification - return 202 Accepted
-                    Ok(Response::builder()
-                        .status(StatusCode::ACCEPTED)
-                        .body(axum::body::Body::empty())
-                        .unwrap())
+                    error!("Failed to parse response as UTF-8");
                 }
             }
             Err(e) => {
                 error!("Routing error: {}", e);
                 
-                // Return JSON-RPC error
-                let error_response = serde_json::json!({
+                // Send error via SSE
+                let error_json = serde_json::json!({
                     "jsonrpc": "2.0",
-                    "id": message_id,
+                    "id": json_value.get("id"),
                     "error": {
                         "code": -32603,
                         "message": e.to_string()
                     }
                 });
                 
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(error_response.to_string()))
-                    .unwrap())
+                let event = Event::default()
+                    .data(error_json.to_string());
+                let _ = tx.send(Ok(event)).await;
             }
         }
+    });
+
+    // 7. Return SSE stream immediately
+    let base_stream = ReceiverStream::new(rx);
+    
+    // For initialize, prepend session event
+    let stream: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> = if is_init {
+        // Include session ID in first event
+        let init_event = Event::default()
+            .event("session")
+            .data(format!("{{\"sessionId\":\"{}\"}}", session_id));
+        
+        // Prepend session event to stream
+        let session_stream = futures::stream::once(async move { Ok(init_event) });
+        Box::pin(futures::StreamExt::chain(session_stream, base_stream))
     } else {
-        warn!("No server name found in message");
-        Err(StatusCode::BAD_REQUEST)
-    }
+        Box::pin(base_stream)
+    };
+    
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 /// Handle GET /mcp - Client opens SSE stream
