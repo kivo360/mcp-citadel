@@ -1,6 +1,6 @@
 [package]
 name = "mcp-citadel"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["Kevin Hill"]
 description = "The Citadel: Central hub for routing multiple MCP servers with 67% memory savings"

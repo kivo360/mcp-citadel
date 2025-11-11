@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::{wrappers::ReceiverStream, Stream};
 use futures::StreamExt;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::config::HttpConfig;
@@ -28,6 +28,14 @@ use crate::router::HubManager;
 
 /// MCP Protocol version supported
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Buffered message for replay
+#[derive(Debug, Clone)]
+struct BufferedMessage {
+    event_id: u64,
+    event_type: Option<String>,
+    data: String,
+}
 
 /// HTTP session state
 #[derive(Debug, Clone)]
@@ -37,11 +45,12 @@ struct HttpSession {
     created_at: Instant,
     last_activity: Instant,
     server_name: Option<String>,
-    /// Channel for sending SSE events
+    /// Channel for sending SSE events (bidirectional communication)
     event_tx: Option<mpsc::Sender<Result<Event, Infallible>>>,
     /// Last event ID for resumability
-    #[allow(dead_code)]
     last_event_id: u64,
+    /// Buffer of recent messages for replay (max 100 messages)
+    message_buffer: Vec<BufferedMessage>,
 }
 
 impl HttpSession {
@@ -53,6 +62,7 @@ impl HttpSession {
             server_name: None,
             event_tx: None,
             last_event_id: 0,
+            message_buffer: Vec::new(),
         }
     }
 
@@ -64,10 +74,32 @@ impl HttpSession {
         self.last_activity = Instant::now();
     }
 
-    #[allow(dead_code)]
-    fn next_event_id(&mut self) -> String {
+    fn next_event_id(&mut self) -> u64 {
         self.last_event_id += 1;
-        self.last_event_id.to_string()
+        self.last_event_id
+    }
+
+    fn buffer_message(&mut self, event_id: u64, event_type: Option<String>, data: String) {
+        const MAX_BUFFER_SIZE: usize = 100;
+        
+        self.message_buffer.push(BufferedMessage {
+            event_id,
+            event_type,
+            data,
+        });
+        
+        // Keep buffer size limited
+        if self.message_buffer.len() > MAX_BUFFER_SIZE {
+            self.message_buffer.remove(0);
+        }
+    }
+
+    fn get_messages_after(&self, last_event_id: u64) -> Vec<BufferedMessage> {
+        self.message_buffer
+            .iter()
+            .filter(|msg| msg.event_id > last_event_id)
+            .cloned()
+            .collect()
     }
 }
 
@@ -120,12 +152,27 @@ impl HttpTransport {
     }
 }
 
-/// Handle POST /mcp - Client sends JSON-RPC message (returns SSE stream)
+/// Response type for handle_post - either JSON or SSE
+enum PostResponse {
+    Json(Response<axum::body::Body>),
+    Sse(Sse<std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>),
+}
+
+impl axum::response::IntoResponse for PostResponse {
+    fn into_response(self) -> Response<axum::body::Body> {
+        match self {
+            PostResponse::Json(r) => r,
+            PostResponse::Sse(sse) => sse.into_response(),
+        }
+    }
+}
+
+/// Handle POST /mcp - Client sends JSON-RPC message (smart response: JSON or SSE)
 async fn handle_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+) -> Result<PostResponse, StatusCode> {
     // 1. Validate Origin header
     validate_origin(&headers)?;
 
@@ -144,11 +191,13 @@ async fn handle_post(
     let json_value: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let is_initialize = json_value
+    let method = json_value
         .get("method")
         .and_then(|m| m.as_str())
-        .map(|m| m == "initialize")
-        .unwrap_or(false);
+        .unwrap_or("");
+    
+    let is_initialize = method == "initialize";
+    let use_streaming = needs_streaming(method);
 
     // 4. Get or create session
     let session_id = headers
@@ -177,79 +226,158 @@ async fn handle_post(
     let server_name = extract_server_name(&body)
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    // 5. Create SSE channel for this request
-    let (tx, rx) = mpsc::channel(100);
-    
-    // Update session with SSE sender
-    if let Some(session_mut) = sessions.get_mut(&session_id) {
-        session_mut.touch();
-        session_mut.server_name = Some(server_name.clone());
-        session_mut.event_tx = Some(tx.clone());
-    }
-    
-    drop(sessions);
-
-    // 6. Spawn async task to handle backend communication
-    let manager = state.manager.clone();
-    let body_clone = body.to_vec();
-    let is_init = is_initialize;
-    
-    tokio::spawn(async move {
-        // Route message to backend (non-blocking for this HTTP handler)
-        match manager.route_message(&server_name, &body_clone).await {
+    // 5. Smart response mode: JSON for simple ops, SSE for streaming
+    if !use_streaming {
+        // Direct JSON response for simple operations
+        drop(sessions);
+        
+        let manager = state.manager.clone();
+        match manager.route_message(&server_name, &body).await {
             Ok(response) => {
-                // Parse response to extract event data
-                if let Ok(json) = std::str::from_utf8(&response) {
-                    let event = Event::default()
-                        .data(json.trim_end());
-                    
-                    // Send via SSE
-                    let _ = tx.send(Ok(event)).await;
-                    
-                    // For initialize, we need to include session ID in a custom header
-                    // (will be handled by response builder below)
-                } else {
-                    error!("Failed to parse response as UTF-8");
-                }
+                Ok(PostResponse::Json(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(response))
+                        .unwrap()
+                ))
             }
             Err(e) => {
-                error!("Routing error: {}", e);
+                error!("Routing error for {}: {}", method, e);
                 
-                // Send error via SSE
+                // Return JSON error response
                 let error_json = serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": json_value.get("id"),
                     "error": {
                         "code": -32603,
-                        "message": e.to_string()
+                        "message": e.to_string(),
+                        "data": {
+                            "type": "routing_error",
+                            "server": server_name
+                        }
                     }
                 });
                 
-                let event = Event::default()
-                    .data(error_json.to_string());
-                let _ = tx.send(Ok(event)).await;
+                Ok(PostResponse::Json(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(error_json.to_string()))
+                        .unwrap()
+                ))
             }
         }
-    });
-
-    // 7. Return SSE stream immediately
-    let base_stream = ReceiverStream::new(rx);
-    
-    // For initialize, prepend session event
-    let stream: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> = if is_init {
-        // Include session ID in first event
-        let init_event = Event::default()
-            .event("session")
-            .data(format!("{{\"sessionId\":\"{}\"}}", session_id));
-        
-        // Prepend session event to stream
-        let session_stream = futures::stream::once(async move { Ok(init_event) });
-        Box::pin(futures::StreamExt::chain(session_stream, base_stream))
     } else {
-        Box::pin(base_stream)
-    };
-    
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+        // SSE streaming for long-running/bidirectional operations
+        let (tx, rx) = mpsc::channel(100);
+        
+        // Get next event ID for this session
+        let event_id = if let Some(session_mut) = sessions.get_mut(&session_id) {
+            session_mut.touch();
+            session_mut.server_name = Some(server_name.clone());
+            session_mut.event_tx = Some(tx.clone());
+            session_mut.next_event_id()
+        } else {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        
+        let sessions_arc = state.sessions.clone();
+        drop(sessions);
+
+        // 6. Spawn async task to handle backend communication
+        let manager = state.manager.clone();
+        let body_clone = body.to_vec();
+        let session_id_clone = session_id.clone();
+        let json_id = json_value.get("id").cloned();
+        
+        tokio::spawn(async move {
+            // Route message to backend (non-blocking for this HTTP handler)
+            match manager.route_message(&server_name, &body_clone).await {
+                Ok(response) => {
+                    // Parse response to extract event data
+                    if let Ok(json) = std::str::from_utf8(&response) {
+                        let event = Event::default()
+                            .id(event_id.to_string())
+                            .data(json.trim_end());
+                        
+                        // Buffer the message for replay
+                        let mut sessions = sessions_arc.lock().await;
+                        if let Some(session) = sessions.get_mut(&session_id_clone) {
+                            session.buffer_message(event_id, None, json.trim_end().to_string());
+                        }
+                        drop(sessions);
+                        
+                        // Send via SSE
+                        let _ = tx.send(Ok(event)).await;
+                    } else {
+                        error!("Failed to parse response as UTF-8");
+                        
+                        // Send parse error
+                        let error_event = Event::default()
+                            .event("error")
+                            .data(serde_json::json!({
+                                "code": -32700,
+                                "message": "Parse error: Invalid UTF-8 response",
+                                "data": { "type": "parse_error" }
+                            }).to_string());
+                        let _ = tx.send(Ok(error_event)).await;
+                    }
+                }
+                Err(e) => {
+                    error!("Routing error: {}", e);
+                    
+                    // Enhanced error with type categorization
+                    let (error_code, error_type) = if e.to_string().contains("not found") {
+                        (-32001, "server_not_found")
+                    } else if e.to_string().contains("timeout") {
+                        (-32002, "timeout")
+                    } else if e.to_string().contains("crashed") {
+                        (-32003, "server_crash")
+                    } else {
+                        (-32603, "internal_error")
+                    };
+                    
+                    let error_json = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": json_id,
+                        "error": {
+                            "code": error_code,
+                            "message": e.to_string(),
+                            "data": {
+                                "type": error_type,
+                                "server": server_name
+                            }
+                        }
+                    });
+                    
+                    let error_event = Event::default()
+                        .event("error")
+                        .data(error_json.to_string());
+                    let _ = tx.send(Ok(error_event)).await;
+                }
+            }
+        });
+
+        // 7. Return SSE stream immediately
+        let base_stream = ReceiverStream::new(rx);
+        
+        // For initialize, prepend session event
+        let stream: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> = if is_initialize {
+            // Include session ID in first event
+            let init_event = Event::default()
+                .event("session")
+                .data(format!("{{\"sessionId\":\"{}\"}}", session_id));
+            
+            // Prepend session event to stream
+            let session_stream = futures::stream::once(async move { Ok(init_event) });
+            Box::pin(futures::StreamExt::chain(session_stream, base_stream))
+        } else {
+            Box::pin(base_stream)
+        };
+        
+        Ok(PostResponse::Sse(Sse::new(stream).keep_alive(KeepAlive::default())))
+    }
 }
 
 /// Handle GET /mcp - Client opens SSE stream
@@ -279,10 +407,14 @@ async fn handle_get(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
 
-    if let Some(last_id) = last_event_id {
-        debug!("Client requesting resumption from event ID: {}", last_id);
-        // TODO: Implement message replay for resumability
-    }
+    // Get buffered messages for replay
+    let replay_messages = if let Some(last_id) = last_event_id {
+        let msgs = session.get_messages_after(last_id);
+        info!("Client resuming from event {}: replaying {} messages", last_id, msgs.len());
+        msgs
+    } else {
+        Vec::new()
+    };
 
     // Create SSE stream
     let (tx, rx) = mpsc::channel(100);
@@ -292,10 +424,47 @@ async fn handle_get(
     
     drop(sessions);
 
+    // Replay buffered messages if resuming
+    if !replay_messages.is_empty() {
+        tokio::spawn(async move {
+            for msg in replay_messages {
+                let mut event = Event::default()
+                    .id(msg.event_id.to_string())
+                    .data(msg.data);
+                
+                if let Some(event_type) = msg.event_type {
+                    event = event.event(event_type);
+                }
+                
+                if tx.send(Ok(event)).await.is_err() {
+                    break; // Client disconnected
+                }
+            }
+        });
+    }
+
     // Create stream from receiver
     let stream = ReceiverStream::new(rx);
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// Determine if a method requires SSE streaming
+fn needs_streaming(method: &str) -> bool {
+    // Methods that need streaming:
+    // - initialize (handshake, needs session event)
+    // - sampling/createMessage (LLM responses, can be long)
+    // - Long-running operations
+    // - Server-initiated requests/notifications
+    
+    matches!(method,
+        "initialize" 
+        | "initialized"
+        | "sampling/createMessage"
+        | "roots/list_changed"
+        | "notifications/cancelled"
+        | "notifications/progress"
+    )
 }
 
 /// Validate Origin header to prevent DNS rebinding attacks
