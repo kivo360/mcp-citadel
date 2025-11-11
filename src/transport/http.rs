@@ -24,6 +24,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::config::HttpConfig;
+use crate::metrics;
 use crate::router::HubManager;
 
 /// MCP Protocol version supported
@@ -51,18 +52,22 @@ struct HttpSession {
     last_event_id: u64,
     /// Buffer of recent messages for replay (max 100 messages)
     message_buffer: Vec<BufferedMessage>,
+    /// Correlation ID for request tracing
+    correlation_id: String,
 }
 
 impl HttpSession {
     fn new() -> Self {
+        let session_id = Uuid::new_v4().to_string();
         Self {
-            id: Uuid::new_v4().to_string(),
+            id: session_id.clone(),
             created_at: Instant::now(),
             last_activity: Instant::now(),
             server_name: None,
             event_tx: None,
             last_event_id: 0,
             message_buffer: Vec::new(),
+            correlation_id: format!("sess_{}", &session_id[..8]),
         }
     }
 
@@ -79,9 +84,7 @@ impl HttpSession {
         self.last_event_id
     }
 
-    fn buffer_message(&mut self, event_id: u64, event_type: Option<String>, data: String) {
-        const MAX_BUFFER_SIZE: usize = 100;
-        
+    fn buffer_message(&mut self, event_id: u64, event_type: Option<String>, data: String, max_size: usize) {
         self.message_buffer.push(BufferedMessage {
             event_id,
             event_type,
@@ -89,7 +92,7 @@ impl HttpSession {
         });
         
         // Keep buffer size limited
-        if self.message_buffer.len() > MAX_BUFFER_SIZE {
+        if self.message_buffer.len() > max_size {
             self.message_buffer.remove(0);
         }
     }
@@ -105,10 +108,10 @@ impl HttpSession {
 
 /// Shared application state
 #[derive(Clone)]
-struct AppState {
-    manager: Arc<HubManager>,
-    sessions: Arc<Mutex<HashMap<String, HttpSession>>>,
-    config: HttpConfig,
+pub(super) struct AppState {
+    pub(super) manager: Arc<HubManager>,
+    pub(super) sessions: Arc<Mutex<HashMap<String, HttpSession>>>,
+    pub(super) config: HttpConfig,
 }
 
 /// HTTP transport server
@@ -141,6 +144,9 @@ impl HttpTransport {
         let app = Router::new()
             .route("/mcp", post(handle_post))
             .route("/mcp", axum::routing::get(handle_get))
+            .route("/ws", axum::routing::get(super::websocket::handle_websocket))
+            .route("/metrics", axum::routing::get(handle_metrics))
+            .route("/health", axum::routing::get(handle_health))
             .with_state(state);
 
         info!("🌐 HTTP transport listening on http://{}", addr);
@@ -221,10 +227,17 @@ async fn handle_post(
     };
 
     let session_id = session.id.clone();
+    let correlation_id = session.correlation_id.clone();
     
     // Extract server name
     let server_name = extract_server_name(&body)
         .ok_or(StatusCode::BAD_REQUEST)?;
+    
+    // Log request with correlation ID
+    info!(
+        "[{}] POST /mcp method={} server={} session={}",
+        correlation_id, method, server_name, &session_id[..8]
+    );
 
     // 5. Smart response mode: JSON for simple ops, SSE for streaming
     if !use_streaming {
@@ -232,8 +245,14 @@ async fn handle_post(
         drop(sessions);
         
         let manager = state.manager.clone();
+        let start = Instant::now();
         match manager.route_message(&server_name, &body).await {
             Ok(response) => {
+                let duration_ms = start.elapsed().as_millis();
+                info!(
+                    "[{}] Response: method={} status=success duration={}ms size={}b",
+                    correlation_id, method, duration_ms, response.len()
+                );
                 Ok(PostResponse::Json(
                     Response::builder()
                         .status(StatusCode::OK)
@@ -243,7 +262,11 @@ async fn handle_post(
                 ))
             }
             Err(e) => {
-                error!("Routing error for {}: {}", method, e);
+                let duration_ms = start.elapsed().as_millis();
+                error!(
+                    "[{}] Error: method={} error={} duration={}ms",
+                    correlation_id, method, e, duration_ms
+                );
                 
                 // Return JSON error response
                 let error_json = serde_json::json!({
@@ -283,6 +306,7 @@ async fn handle_post(
         };
         
         let sessions_arc = state.sessions.clone();
+        let buffer_size = state.config.message_buffer_size;
         drop(sessions);
 
         // 6. Spawn async task to handle backend communication
@@ -304,7 +328,7 @@ async fn handle_post(
                         // Buffer the message for replay
                         let mut sessions = sessions_arc.lock().await;
                         if let Some(session) = sessions.get_mut(&session_id_clone) {
-                            session.buffer_message(event_id, None, json.trim_end().to_string());
+                            session.buffer_message(event_id, None, json.trim_end().to_string(), buffer_size);
                         }
                         drop(sessions);
                         
@@ -515,6 +539,61 @@ fn extract_server_name(message: &[u8]) -> Option<String> {
     None
 }
 
+/// Handle GET /metrics - Prometheus metrics endpoint
+async fn handle_metrics() -> Result<Response<axum::body::Body>, StatusCode> {
+    match metrics::export_metrics() {
+        Ok(metrics_text) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
+            .body(axum::body::Body::from(metrics_text))
+            .unwrap()),
+        Err(e) => {
+            error!("Failed to export metrics: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Handle GET /health - Health check endpoint
+async fn handle_health(State(state): State<AppState>) -> Result<Response<axum::body::Body>, StatusCode> {
+    let sessions = state.sessions.lock().await;
+    let session_count = sessions.len();
+    drop(sessions);
+    
+    let server_list = state.manager.list_servers().await;
+    let server_count = server_list.len();
+    
+    // Calculate uptime
+    let uptime_secs = state.manager.uptime();
+    
+    // Determine health status
+    let is_healthy = server_count > 0;
+    let status_code = if is_healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    
+    let health_response = serde_json::json!({
+        "status": if is_healthy { "healthy" } else { "unhealthy" },
+        "uptime_seconds": uptime_secs,
+        "mcp_servers": {
+            "total": server_count,
+            "list": server_list
+        },
+        "http_sessions": {
+            "active": session_count
+        },
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    });
+    
+    Ok(Response::builder()
+        .status(status_code)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(health_response.to_string()))
+        .unwrap())
+}
+
 /// Background task to cleanup expired sessions
 async fn session_cleanup_task(state: AppState) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -524,6 +603,16 @@ async fn session_cleanup_task(state: AppState) {
         
         let timeout = Duration::from_secs(state.config.session_timeout_secs);
         let mut sessions = state.sessions.lock().await;
+        
+        // Update metrics
+        metrics::set_active_sessions(sessions.len());
+        
+        // Calculate total buffer size
+        let total_buffer_size: usize = sessions
+            .values()
+            .map(|s| s.message_buffer.len())
+            .sum();
+        metrics::set_message_buffer_size(total_buffer_size);
         
         let expired: Vec<String> = sessions
             .iter()

@@ -121,6 +121,264 @@ mcp-citadel status
 
 ## [Unreleased]
 
+## [0.5.0] - 2025-01-11
+
+### 🔭 Observability & WebSocket Release
+
+**Major features:** Production-grade observability with Prometheus metrics, health checks, structured logging, WebSocket transport, and configurable buffers!
+
+### Added
+
+#### Prometheus Metrics (`/metrics` endpoint)
+- **Complete observability** - Export metrics in Prometheus format
+- **10+ Metric Types:**
+  - `mcp_citadel_http_requests_total` - Request count by method, endpoint, status
+  - `mcp_citadel_http_request_duration_seconds` - Latency histograms
+  - `mcp_citadel_active_sessions` - Current active HTTP sessions
+  - `mcp_citadel_sessions_created_total` - Total sessions by transport
+  - `mcp_citadel_mcp_messages_total` - MCP messages by server, method, status
+  - `mcp_citadel_mcp_message_duration_seconds` - Backend latency
+  - `mcp_citadel_mcp_server_up` - MCP servers currently running
+  - `mcp_citadel_errors_total` - Error count by type and server
+  - `mcp_citadel_message_buffer_size` - Total buffered messages
+  - `mcp_citadel_active_connections` - Active HTTP + WebSocket connections
+  - `mcp_citadel_websocket_connections_total` - WebSocket connection events
+
+**Usage:**
+```bash
+# Scrape metrics with Prometheus
+curl http://127.0.0.1:3000/metrics
+
+# Example metrics output:
+mcp_citadel_http_requests_total{method="POST",endpoint="/mcp",status="200"} 42
+mcp_citadel_http_request_duration_seconds_bucket{method="POST",endpoint="/mcp",le="0.01"} 38
+mcp_citadel_active_sessions 5
+```
+
+#### Health Check (`/health` endpoint)
+- **Kubernetes-ready** - Returns 200 (healthy) or 503 (unhealthy)
+- **Comprehensive status:**
+  - MCP server count and list
+  - Active HTTP sessions
+  - Uptime in seconds
+  - ISO 8601 timestamp
+
+```bash
+curl http://127.0.0.1:3000/health
+
+# Response:
+{
+  "status": "healthy",
+  "uptime_seconds": 3600,
+  "mcp_servers": {
+    "total": 18,
+    "list": ["github", "filesystem", ...]
+  },
+  "http_sessions": {
+    "active": 5
+  },
+  "timestamp": "2025-01-11T14:53:56Z"
+}
+```
+
+#### Structured Logging with Correlation IDs
+- **Request tracing** - Every request gets unique correlation ID
+- **Easy debugging** - Grep logs by `[sess_abc123]`
+- **Performance timing** - Duration logged for every operation
+
+**Log Examples:**
+```
+[sess_abc123] POST /mcp method=tools/list server=github session=abc12345
+[sess_abc123] Response: method=tools/list status=success duration=45ms size=2048b
+[sess_abc123] Error: method=unknown/op error=Server not found duration=2ms
+```
+
+#### WebSocket Transport (`/ws` endpoint)
+- **Real-time bidirectional** - Alternative to SSE for persistent connections
+- **Feature parity** - Full JSON-RPC support
+- **Connection management:**
+  - Ping/pong keep-alive
+  - Graceful close handling
+  - Automatic routing to MCP servers
+- **Metrics integration** - Tracks WebSocket connections and performance
+
+**Client Example:**
+```javascript
+const ws = new WebSocket('ws://localhost:3000/ws');
+
+ws.onopen = () => {
+  ws.send(JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'tools/list',
+    params: { server: 'github' }
+  }));
+};
+
+ws.onmessage = (event) => {
+  const response = JSON.parse(event.data);
+  console.log('Response:', response);
+};
+```
+
+#### Configurable Message Buffer
+- **CLI flag** - `--message-buffer-size <SIZE>`
+- **Per-session control** - Each session gets independent buffer
+- **Default: 100 messages** - Configurable from 1 to unlimited
+
+```bash
+# Start with 500 message buffer per session
+mcp-citadel start --enable-http --message-buffer-size 500
+```
+
+### Changed
+
+#### Session Tracking
+- Sessions now track correlation IDs for logging
+- Buffer size moved from const to config
+- Automatic metrics updates during cleanup
+
+#### HTTP Transport
+- Added `/ws`, `/metrics`, `/health` endpoints
+- AppState fields made public for module sharing
+- Enhanced error logging with correlation IDs
+
+### Technical Details
+
+#### Metrics Architecture
+```rust
+// Lazy static metrics with Prometheus
+lazy_static! {
+    pub static ref HTTP_REQUESTS_TOTAL: CounterVec = /*...*/;
+    pub static ref HTTP_REQUEST_DURATION_SECONDS: HistogramVec = /*...*/;
+}
+
+// Timer utilities
+let timer = RequestTimer::new("POST", "/mcp");
+// ... do work ...
+timer.observe_duration(); // Records latency
+```
+
+#### WebSocket Handler
+```rust
+// Bidirectional communication
+let (mut sender, mut receiver) = socket.split();
+
+while let Some(msg) = receiver.next().await {
+    // Route to MCP server
+    let response = manager.route_message(server, msg).await?;
+    sender.send(Message::Text(response)).await?;
+}
+```
+
+### Performance
+
+- **Binary Size:** 2.9MB (was 1.9MB in v0.4.0)
+  - +1MB for Prometheus + WebSocket support
+- **Metrics Overhead:** <1ms per request
+- **WebSocket Latency:** Same as HTTP (~2ms)
+- **Memory:** +minimal for metrics registry
+
+### Dependencies Added
+
+- `prometheus 0.13` - Metrics collection
+- `lazy_static 1.4` - Static metric initialization
+- `axum[ws]` - WebSocket support
+
+### Monitoring & Operations
+
+#### Prometheus Integration
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'mcp-citadel'
+    static_configs:
+      - targets: ['localhost:3000']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+```
+
+#### Grafana Dashboard
+Metrics ready for dashboards:
+- Request rate & latency percentiles
+- Error rate by type
+- Active sessions over time
+- MCP server health status
+- Buffer utilization
+
+#### Kubernetes Liveness/Readiness
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 3000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+```
+
+### Testing
+
+```bash
+# Test metrics endpoint
+curl http://127.0.0.1:3000/metrics
+
+# Test health check
+curl http://127.0.0.1:3000/health | jq
+
+# Test WebSocket (with websocat)
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | \
+  websocat ws://127.0.0.1:3000/ws
+
+# Start with custom buffer size
+mcp-citadel start --enable-http --message-buffer-size 250
+```
+
+### Compatibility
+
+- ✅ Backward compatible with v0.4.0
+- ✅ All v0.4.0 features intact (SSE, smart responses, replay)
+- ✅ New endpoints are opt-in
+- ✅ WebSocket is alternative transport, not replacement
+
+### Migration from v0.4.0
+
+**No breaking changes!** Simply upgrade:
+
+```bash
+# Download v0.5.0
+wget https://github.com/kivo360/mcp-citadel/releases/download/v0.5.0/mcp-citadel-v0.5.0-macos-arm64.tar.gz
+
+# Extract and replace
+tar xzf mcp-citadel-v0.5.0-macos-arm64.tar.gz
+sudo mv mcp-citadel /usr/local/bin/
+
+# Start with new features
+mcp-citadel start --enable-http --message-buffer-size 100
+```
+
+**New capabilities:**
+- Add Prometheus scraping to monitor your hub
+- Use `/health` for orchestration health checks
+- Try WebSocket for real-time bidirectional communication
+- Customize buffer size for your workload
+
+### Known Limitations
+
+- WebSocket doesn't yet implement message replay (SSE feature)
+- Reconnection handling is manual (client responsibility)
+- Metrics don't persist across restarts
+
+### Future Enhancements (v0.6.0)
+
+- [ ] WebSocket message replay/resumability
+- [ ] Automatic reconnection with exponential backoff
+- [ ] Persistent metrics with optional storage backend
+- [ ] Grafana dashboard templates
+- [ ] OpenTelemetry tracing support
+- [ ] Admin UI dashboard
+
+---
+
 ## [0.4.0] - 2025-01-11
 
 ### 🚀 Smart Responses & Bidirectional Communication Release

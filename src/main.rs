@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod daemon;
+mod metrics;
 mod router;
 mod transport;
 
@@ -21,9 +22,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { foreground, log_file, enable_http, http_port, http_host } => {
+        Commands::Start { foreground, log_file, enable_http, http_port, http_host, message_buffer_size } => {
             if foreground {
-                start_hub(foreground, log_file, enable_http, http_port, http_host).await?;
+                start_hub(foreground, log_file, enable_http, http_port, http_host, message_buffer_size).await?;
             } else {
                 daemon::daemonize()?;
             }
@@ -49,6 +50,7 @@ async fn start_hub(
     enable_http: bool,
     http_port: u16,
     http_host: String,
+    message_buffer_size: usize,
 ) -> Result<()> {
     // Check if already running
     if daemon::is_running()? {
@@ -111,6 +113,7 @@ async fn start_hub(
             http_config.enabled = true;
             http_config.port = http_port;
             http_config.host = http_host.clone();
+            http_config.message_buffer_size = message_buffer_size;
         }
     }
     

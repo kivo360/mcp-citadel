@@ -35,6 +35,10 @@ pub enum Commands {
         /// HTTP host (default: 127.0.0.1)
         #[arg(long, default_value = "127.0.0.1")]
         http_host: String,
+        
+        /// Message buffer size per session (default: 100)
+        #[arg(long, default_value = "100")]
+        message_buffer_size: usize,
     },
 
     /// Stop the MCP hub

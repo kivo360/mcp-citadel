@@ -1,6 +1,6 @@
 [package]
 name = "mcp-citadel"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["Kevin Hill"]
 description = "The Citadel: Central hub for routing multiple MCP servers with 67% memory savings"
@@ -12,11 +12,18 @@ tokio = { version = "1.46", features = ["full"] }
 tokio-stream = "0.1"
 
 # HTTP server and SSE
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 axum-extra = { version = "0.9", features = ["typed-header"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 headers = "0.4"
+
+# WebSocket support
+tokio-tungstenite = "0.21"
+
+# Metrics and observability
+prometheus = { version = "0.13", features = ["process"] }
+lazy_static = "1.4"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

@@ -30,6 +30,8 @@ pub struct HttpConfig {
     pub port: u16,
     /// Session timeout in seconds
     pub session_timeout_secs: u64,
+    /// Message buffer size per session
+    pub message_buffer_size: usize,
 }
 
 impl Default for HubConfig {
@@ -52,6 +54,7 @@ impl Default for HttpConfig {
             host: "127.0.0.1".to_string(),
             port: 3000,
             session_timeout_secs: 3600, // 1 hour
+            message_buffer_size: 100,    // 100 messages per session
         }
     }
 }
